@@ -9,7 +9,8 @@ from your own loop.
 What it computes per frame (same logic as the single-image version):
   1. Hand segmentation (bright hand vs dark background)
   2. All dark areas (veins/shadows) inside the hand, ranked by size
-  3. Largest all-dark spot (max inscribed circle) inside region #1
+  3. Best sites: largest all-dark spot (max inscribed circle) inside
+     each of the top-3 regions, drawn as numbered dot-and-circle markers
 
 Key optimizations vs. the single-image script:
   * All heavy work runs on a DOWNSCALED copy (default 640 px wide);
@@ -60,6 +61,12 @@ import numpy as np
 # Core analyzer
 # ======================================================================
 class HandDarkAreaStreamAnalyzer:
+    # top-3 ranks each get their own color, shared by the region box, its
+    # label, and the site marker; rank 4+ draws green with no marker
+    RANK_COLORS = {1: (0, 255, 255),   # yellow
+                   2: (255, 255, 0),   # cyan
+                   3: (0, 165, 255)}   # orange
+
     def __init__(
         self,
         proc_width: int = 640,        # working resolution (px). Lower = faster.
@@ -158,19 +165,20 @@ class HandDarkAreaStreamAnalyzer:
                 "centroid": [int(ce[0] * S), int(ce[1] * S)],
             })
 
-        # ---- 3) largest all-dark circle inside region #1 (bbox crop only)
-        circle = None
-        if regions:
-            i, _, st, _ = regions[0]
+        # ---- 3) best sites: largest all-dark circle inside each of the
+        #      top-3 regions (bbox crops only)
+        sites = []
+        for rank, (i, _, st, _) in enumerate(regions[:3], 1):
             x, y, w, h = (int(v) for v in st[:4])
             crop = np.where(lbl[y:y + h, x:x + w] == i, 255, 0).astype(np.uint8)
             dist = cv2.distanceTransform(crop, cv2.DIST_L2, 3)
             _, radius, _, loc = cv2.minMaxLoc(dist)
-            circle = {
+            sites.append({
+                "rank": rank,
                 "center": [int((x + loc[0]) * S), int((y + loc[1]) * S)],
                 "radius_px": round(radius * S, 1),
                 "area_px": int(np.pi * (radius * S) ** 2),
-            }
+            })
 
         dark_area_full = int(np.sum(dark == 255) * S * S)
         self._frame_idx += 1
@@ -180,7 +188,9 @@ class HandDarkAreaStreamAnalyzer:
             "dark_area_px": dark_area_full,
             "dark_pct_of_hand": round(100 * dark_area_full / max(self._hand_area_full, 1), 2),
             "regions": out_regions,
-            "region1_largest_all_dark_circle": circle,
+            "best_sites": sites,
+            # legacy key: same data as best_sites[0]
+            "region1_largest_all_dark_circle": sites[0] if sites else None,
             "proc_ms": round((time.perf_counter() - t0) * 1000, 2),
             "_mask_small": dark,       # internal, for annotate()
         }
@@ -210,17 +220,48 @@ class HandDarkAreaStreamAnalyzer:
             red = vis.copy()
             red[mask == 255] = (0, 0, 255)
             vis = cv2.addWeighted(vis, 0.6, red, 0.4, 0)
-        t = max(1, vis.shape[1] // 800)
+        t = max(2, vis.shape[1] // 600)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        halo = (0, 0, 0)   # black rim under every stroke so color never
+                           # has to fight a same-brightness background
+
+        def rect(p1, p2, color, w):
+            cv2.rectangle(vis, p1, p2, halo, w * 2 + 2)
+            cv2.rectangle(vis, p1, p2, color, w)
+
+        def text(s, org, color, scale, w):
+            cv2.putText(vis, s, org, font, scale, halo, w * 3, cv2.LINE_AA)
+            cv2.putText(vis, s, org, font, scale, color, w, cv2.LINE_AA)
+
+        def ring(c, r, color, w):
+            cv2.circle(vis, c, r, halo, w * 2 + 2)
+            cv2.circle(vis, c, r, color, w)
+
         for r in result["regions"]:
             x, y, w, h = r["bbox"]
-            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), t)
-            cv2.putText(vis, f"#{r['rank']}", (x, max(15, y - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * t, (0, 255, 0), t)
-        c = result["region1_largest_all_dark_circle"]
-        if c:
-            cv2.circle(vis, tuple(c["center"]), int(c["radius_px"]), (255, 255, 0), 2 * t)
-        cv2.putText(vis, f"{result['proc_ms']:.1f} ms  dark={result['dark_pct_of_hand']}%",
-                    (10, 25 * t), cv2.FONT_HERSHEY_SIMPLEX, 0.6 * t, (255, 255, 255), t)
+            color = self.RANK_COLORS.get(r["rank"], (0, 255, 0))
+            rect((x, y), (x + w, y + h), color, t)
+
+        for s in result.get("best_sites", []):
+            color = self.RANK_COLORS.get(s["rank"], (0, 255, 0))
+            cx, cy = s["center"]
+            ring((cx, cy), 46, color, 5)
+            cv2.circle(vis, (cx, cy), 9, halo, -1)
+            cv2.circle(vis, (cx, cy), 6, color, -1)
+
+        # legend: the only text besides the stats line -- one row per site,
+        # marker icon + rank number in that rank's color
+        lx, ly = 8 * t, 55 * t
+        for s in result.get("best_sites", []):
+            color = self.RANK_COLORS.get(s["rank"], (0, 255, 0))
+            ring((lx, ly), 5 * t, color, 5)
+            cv2.circle(vis, (lx, ly), 6, color, -1)
+            text(str(s["rank"]), (lx + 9 * t, ly + 4 * t),
+                 color, 0.5 * t, t + 1)
+            ly += 16 * t
+
+        text(f"{result['proc_ms']:.1f} ms  dark={result['dark_pct_of_hand']}%",
+             (10, 25 * t), (255, 255, 255), 0.6 * t, t)
         return vis
 
 
